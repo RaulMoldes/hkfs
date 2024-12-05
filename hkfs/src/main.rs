@@ -7,18 +7,10 @@ mod datanode;
 
 use namenode::NameNode;
 use datanode::DataNode;
-use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
 
-mod namenode;
-mod datanode;
-
-use namenode::NameNode;
-use datanode::DataNode;
 
 // Definición de constantes
-const NUM_NODES: u32 = 3; // Número de nodos
+const NUM_NODES: u32 = 30; // Número de nodos
 const CHECK_INTERVAL_SECS: u64 = 15; // Intervalo de verificación en segundos
 
 fn main() {
