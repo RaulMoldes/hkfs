@@ -29,6 +29,21 @@ This project aims to replicate some of the basic functionalities of Hadoop, such
 - **`datanode.rs`**: Contains the logic for the DataNodes that periodically send heartbeats to the NameNode.
 - **`Cargo.toml`**: The configuration file for the Rust project, including dependencies and project settings.
 
----
-
-
+## Usage
+- Start the namenode: 
+```bash
+  cargo run --bin namenode
+```
+- Start as many datanodes as you want:
+```bash
+  cargo run --bin datanode
+```
+- Use the API provided on port 8080:
+**Datanode status**
+```bash
+  curl http://127.0.0.1:8080/status
+```
+**Store a block api**
+```bash
+curl -X POST "http://127.0.0.1:8080/storeblock" -H "Content-Type: application/json" -d '{"block_id": "1"}
+```

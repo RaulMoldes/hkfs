@@ -6,6 +6,11 @@ pub enum DataNodeMessage {
     Register { key: String },
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+pub enum DataMessage {
+    StoreBlock { block_id: String, data: Vec<u8> },
+}
+
 #[derive(Serialize)]
 pub struct StatusResponse {
     pub status: Vec<String>,

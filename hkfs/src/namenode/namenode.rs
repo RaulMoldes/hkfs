@@ -8,10 +8,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use messages::{DataNodeMessage, StatusResponse};
+use messages::{DataMessage, DataNodeMessage, StatusResponse};
 
 const MAX_INACTIVITY_DURATION: u64 = 4; // Máxima inactividad en segundos
 const NAMENODE_PORT: &str = "127.0.0.1:7878";
+const API_PORT: usize = 8080;
 const VERIFICATION_INTERVAL: u64 = 8;
 // Lista predeterminada de claves válidas como constante global
 const DEFAULT_KEYS: &[&str] = &["SBXBUSKANKLAKA"];
@@ -19,6 +20,7 @@ const DEFAULT_KEYS: &[&str] = &["SBXBUSKANKLAKA"];
 #[derive(Debug)]
 pub struct DataNodeInfo {
     pub is_active: bool,
+    pub port: usize,
     pub last_heartbeat: Instant,
 }
 
@@ -82,6 +84,7 @@ impl NameNode {
             node_id,
             DataNodeInfo {
                 is_active: true,
+                port: API_PORT + node_id as usize,
                 last_heartbeat: Instant::now(),
             },
         );
@@ -136,6 +139,42 @@ impl NameNode {
 
         HttpResponse::Ok().json(StatusResponse { status })
     }
+    // Método para almacenar un bloque en el primer DataNode disponible
+    pub fn api_storeblock(&self, block_id: String) -> HttpResponse {
+        print!("ME METO AQUI");
+        let nodes = self.nodes.lock().unwrap();
+        print!("ME METO AQUI TAMBIEN");
+        // Buscar el primer DataNode activo
+        let node_id = nodes
+            .iter()
+            .find(|(_, node_info)| node_info.is_active)
+            .map(|(node_id, _)| *node_id);
+
+        match node_id {
+            Some(node_id) => {
+                let response = format!("Bloque {} almacenado en Node {}", block_id, node_id);
+
+                // Crear un nuevo stream y enviar un mensaje al DataNode para almacenar el bloque
+                let datanode_port = nodes.get(&node_id).unwrap().port;
+                let datanode_address = format!("127.0.0.1:{}", datanode_port);
+                if let Ok(mut stream) = TcpStream::connect(datanode_address) {
+                    let data_message = DataMessage::StoreBlock {
+                        block_id: block_id.clone(),
+                        data: vec![0; 1024], // Datos de ejemplo
+                    };
+                    let message = serde_json::to_string(&data_message).unwrap();
+                    let _ = stream.write_all(message.as_bytes());
+                } else {
+                    return HttpResponse::InternalServerError()
+                        .json("No se pudo conectar con el DataNode");
+                }
+
+                HttpResponse::Ok().json(response)
+            }
+            None => HttpResponse::BadRequest()
+                .json("No hay nodos activos disponibles para almacenar el bloque"),
+        }
+    }
 }
 
 pub fn start_namenode(namenode: web::Data<Arc<NameNode>>) {
@@ -167,13 +206,19 @@ async fn api_get_status(namenode: web::Data<Arc<NameNode>>) -> HttpResponse {
     namenode.api_get_status()
 }
 
+async fn api_post_storeblock(namenode: web::Data<Arc<NameNode>>, block_id: String) -> HttpResponse {
+    print!("Almacenando bloque con ID: {}", block_id);
+    namenode.api_storeblock(block_id.clone())
+}
+
 async fn run_api_server(namenode: web::Data<Arc<NameNode>>) {
     HttpServer::new(move || {
         App::new()
             .app_data(namenode.clone()) // Agrega el Arc<NameNode> a las rutas
-            .route("/status", web::get().to(api_get_status)) // Obtener estado de los nodos
+            .route("/status", web::get().to(api_get_status))
+            .route("/storeblock", web::post().to(api_post_storeblock)) // Agregar la ruta para almacenar bloques
     })
-    .bind("127.0.0.1:8080")
+    .bind(format!("127.0.0.1:{}", API_PORT))
     .expect("Unable to start API server")
     .run()
     .await
