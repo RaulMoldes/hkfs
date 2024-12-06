@@ -25,8 +25,8 @@ This project aims to replicate some of the basic functionalities of Hadoop, such
 
 ## Project Structure
 
-- **`namenode.rs`**: Contains the logic for the NameNode, including accepting incoming heartbeat connections from DataNodes.
-- **`datanode.rs`**: Contains the logic for the DataNodes that periodically send heartbeats to the NameNode.
+- **`namenode/namenode.rs`**: Contains the logic for the NameNode, including accepting incoming heartbeat connections from DataNodes.
+- **`datanode/datanode.rs`**: Contains the logic for the DataNodes that periodically send heartbeats to the NameNode.
 - **`Cargo.toml`**: The configuration file for the Rust project, including dependencies and project settings.
 
 ## Usage
