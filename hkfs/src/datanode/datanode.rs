@@ -41,7 +41,7 @@ impl DataNode {
                 let response = String::from_utf8_lossy(&buffer[..size]);
 
                 if response.starts_with("register_accepted:") {
-                    let id: u32 = response[18..].parse().unwrap();
+                    let id: u32 = response.strip_prefix("register_accepted:").unwrap().parse().unwrap();
                     println!("Registro exitoso, ID asignado: {}", id);
                     self.id = Some(id);
                     Ok(())
@@ -72,7 +72,7 @@ impl DataNode {
                     println!("Se envió el heartbeat correctamente. Sigo activo.");
             
                 } else {
-                     eprintln!("Error: {}", response.to_string());
+                     eprintln!("Error: {}", response);
                  }
                 }
                 Err(e) => eprintln!("Error al conectarse al NameNode: {}", e),
