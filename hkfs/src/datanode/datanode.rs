@@ -6,8 +6,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
-
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, timeout, Duration};
 
 use blockdata::BlockData;
 use messages::{DataMessage, DataNodeMessage};
@@ -31,8 +30,6 @@ struct DataNode {
     key: String,
     port: Option<usize>,
     blocks: Option<Vec<BlockDataInfo>>,
-  
-
 }
 
 impl DataNode {
@@ -43,8 +40,6 @@ impl DataNode {
             key,
             port: None,
             blocks: None,
-            
-
         }
     }
 
@@ -98,24 +93,28 @@ impl DataNode {
     }
 
     async fn start_listening(&mut self) -> Option<TcpListener> {
-        let listener = TcpListener::bind(format!("127.0.0.1:{}", self.port.unwrap())).await.unwrap();
+        let listener = TcpListener::bind(format!("127.0.0.1:{}", self.port.unwrap()))
+            .await
+            .unwrap();
         println!(
             "Escuchando en el puerto {} para recibir bloques...",
             self.port.unwrap()
         );
 
         Some(listener)
-      
     }
 
-    // Método para escuchar el puerto asignado para recibir StoreBlock
-    async fn handle_connection(&mut self, mut stream: tokio::net::TcpStream) {
+     // Método para manejar la conexión de un cliente
+     async fn handle_connection(&mut self, mut stream: tokio::net::TcpStream) {
         let mut buffer = Vec::new();
+        
+        // Intentamos leer los datos del stream
         if let Err(e) = stream.read_to_end(&mut buffer).await {
             eprintln!("Error al leer datos del stream: {}", e);
             return;
         }
 
+        // Intentamos deserializar el mensaje recibido
         match serde_json::from_slice::<DataMessage>(&buffer) {
             Ok(DataMessage::StoreBlock { block_id, data }) => {
                 println!(
@@ -123,18 +122,37 @@ impl DataNode {
                     block_id,
                     data.len()
                 );
+                // Almacenar el bloque
                 self.store_block(block_id, &data).await;
             }
             Ok(DataMessage::ReadBlock { block_id }) => {
                 println!("Se solicita el bloque con ID: {}", block_id);
-                self.send_block(block_id).await;
+                
+                // Enviar el bloque solicitado
+                match self.send_block(block_id).await {
+                    Ok(data) => {
+                        let response_message = DataNodeMessage::BlockData { data };
+                        match serde_json::to_string(&response_message) {
+                            Ok(serialized) => {
+                                if let Err(e) = stream.write_all(serialized.as_bytes()).await {
+                                    eprintln!("Error al enviar el mensaje de respuesta: {}", e);
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("Error al serializar el mensaje de respuesta: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error al enviar el bloque: {}", e);
+                    }
+                }
             }
             Err(e) => {
                 eprintln!("Error al deserializar el mensaje: {}", e);
             }
         }
     }
-
     // Método para simular el almacenamiento de un bloque
     async fn store_block(&mut self, block_id: String, data: &[u8]) {
         println!("Almacenando bloque con ID {}. Datos: {:?}", block_id, data);
@@ -208,71 +226,47 @@ impl DataNode {
         }
     }
 
-    pub async fn send_block(&mut self, block_id: String) {
-        // Verificamos si los bloques están disponibles
+    async fn send_block(&mut self, block_id: String) -> Result<Vec<u8>, String> {
+        println!("Checando bloques...");
+
         if let Some(blocks) = &self.blocks {
-            // Buscamos el bloque con el ID proporcionado
+            // Buscar el bloque con el ID proporcionado
             if let Some(block_info) = blocks.iter().find(|b| b.block_id == block_id) {
                 let mut block = BlockData {
                     block_id: block_info.block_id.clone(),
                     path: block_info.path.clone(),
                 };
 
-                // Intentamos cargar los datos del bloque de manera asincrónica
-                match block.load_block().await {
-                    Ok(data) => {
-                        let send_block_message = DataMessage::StoreBlock {
-                            block_id: block_info.block_id.clone(),
-                            data,
-                        };
+                println!("Bloque encontrado: {}", block_info.block_id);
 
-                        // Intentamos conectar de manera asincrónica al NameNode
-                        if let Err(e) = self.send_to_namenode(send_block_message).await {
-                            eprintln!("Error al enviar el bloque: {}", e);
-                        }
+                // Intentar cargar los datos del bloque con un timeout
+                match timeout(Duration::from_secs(10), block.load_block()).await {
+                    Ok(Ok(data)) => {
+                        println!("Bloque cargado correctamente.");
+                        Ok(data)
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         eprintln!("Error al cargar el bloque: {}", e);
+                        Err("Error al cargar el bloque.".into())
+                    }
+                    Err(_) => {
+                        eprintln!("Timeout al cargar el bloque.");
+                        Err("Timeout al cargar el bloque.".into())
                     }
                 }
             } else {
-                println!("Bloque con ID {} no encontrado.", block_id);
+                let err_msg = format!("Bloque con ID {} no encontrado.", block_id);
+                eprintln!("{}", err_msg);
+                Err(err_msg)
             }
         } else {
-            println!("No hay bloques almacenados.");
+            let err_msg = "No hay bloques almacenados.".to_string();
+            eprintln!("{}", err_msg);
+            Err(err_msg)
         }
     }
 
-    // Función auxiliar para enviar el mensaje al NameNode
-    async fn send_to_namenode(&self, send_block_message: DataMessage) -> Result<(), String> {
-        match TcpStream::connect(&self.server_address).await {
-            Ok(mut stream) => {
-                let serialized = serde_json::to_string(&send_block_message)
-                    .map_err(|e| format!("Error al serializar el mensaje del bloque: {}", e))?;
-
-                stream
-                    .write_all(serialized.as_bytes())
-                    .await
-                    .map_err(|e| format!("Error al enviar el bloque: {}", e))?;
-
-                let mut buffer = [0; 128];
-                let size = stream
-                    .read(&mut buffer)
-                    .await
-                    .map_err(|e| format!("Error al leer la respuesta del NameNode: {}", e))?;
-
-                let response = String::from_utf8_lossy(&buffer[..size]);
-
-                if response.starts_with("received_block") {
-                    println!("Bloque enviado correctamente.");
-                    Ok(())
-                } else {
-                    Err(format!("Error al recibir respuesta: {}", response))
-                }
-            }
-            Err(e) => Err(format!("Error al conectarse al NameNode: {}", e)),
-        }
-    }
+    
 }
 
 #[tokio::main]
@@ -290,13 +284,14 @@ async fn main() {
             return;
         }
     }
+
     // Empezar a escuchar conexiones:
     let listener = {
         let mut datanode_guard = datanode.lock().await;
         datanode_guard.start_listening().await
     };
-    // Tarea asíncrona para enviar el heartbeat
 
+  
     // Tarea asíncrona para enviar el heartbeat
     let datanode_clone_heartbeat = Arc::clone(&datanode);
     let heartbeat_handler = tokio::spawn(async move {
@@ -306,17 +301,22 @@ async fn main() {
             sleep(Duration::from_secs(1)).await; // Espera 1 segundo antes de enviar el siguiente heartbeat
         }
     });
-
+    
     // Tarea asíncrona para escuchar conexiones
     let datanode_clone_connections = Arc::clone(&datanode);
     let connection_handle = tokio::spawn(async move {
         loop {
             if let Some(ref listener) = listener {
                 // Esperamos a que lleguen conexiones
-                let (stream, _) = listener.accept().await.unwrap();
-                // Al llegar una nueva conexión, la manejamos
-                let mut datanode_guard = datanode_clone_connections.lock().await;
-                datanode_guard.handle_connection(stream).await;
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        let mut datanode_guard = datanode_clone_connections.lock().await;
+                        datanode_guard.handle_connection(stream).await;
+                    }
+                    Err(e) => {
+                        eprintln!("Error al aceptar conexión: {}", e);
+                    }
+                }
             } else {
                 eprintln!("No se pudo obtener el listener");
             }
@@ -324,8 +324,7 @@ async fn main() {
             sleep(Duration::from_secs(1)).await; // Espera antes de aceptar la siguiente conexión
         }
     });
-    // Deja que ambas tareas corran indefinidamente
-
-    // Usa `tokio::join!` para esperar a que ambas tareas se ejecuten en paralelo.
-    let _ = tokio::join!(heartbeat_handler, connection_handle); // Dormir para que las tareas continúen ejecutándose
+    let _ = tokio::join!(heartbeat_handler, connection_handle); 
+    
+    
 }

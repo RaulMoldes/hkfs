@@ -4,7 +4,7 @@ use ::serde::{Deserialize, Serialize};
 pub enum DataNodeMessage {
     Heartbeat { node_id: u32 },
     Register { key: String },
-    ReadBlock { block_id: String, data: Vec<u8> },
+    BlockData {  data: Vec<u8> },
 }
 
 #[derive(Serialize, Deserialize, Debug)]

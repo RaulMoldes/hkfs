@@ -58,6 +58,11 @@ impl NameNode {
                         Ok(DataNodeMessage::Heartbeat { node_id }) => {
                             self.receive_heartbeat(&mut stream, node_id).await;
                         }
+                        Ok(DataNodeMessage::BlockData { data }) => {
+                            println!("Recibido  bloque {:?}", data);
+
+                            // Implementar la lógica para leer el bloque del DataNode
+                        }
                         Err(_) => eprintln!("Mensaje inválido recibido: {}", message),
                     }
                 }
@@ -240,6 +245,8 @@ impl NameNode {
                             eprintln!("Error al enviar el mensaje al DataNode: {}", e);
                             return HttpResponse::InternalServerError()
                                 .json("Error al comunicar con el DataNode");
+                        } else {
+                            println!("Mensaje enviado al DataNode");
                         }
 
                         // Leer la respuesta del DataNode
@@ -248,6 +255,8 @@ impl NameNode {
                             eprintln!("Error al leer los datos del DataNode: {}", e);
                             return HttpResponse::InternalServerError()
                                 .json("Error al leer el bloque del DataNode");
+                        } else {
+                            println!("Datos leídos del DataNode");
                         }
 
                         // Responder con los datos del bloque
