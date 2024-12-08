@@ -2,16 +2,16 @@ mod messages;
 
 use actix_web::{web, App, HttpResponse, HttpServer};
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
+use tokio::time::{Duration, Instant};
 
-use messages::{DataMessage, DataNodeMessage, StatusResponse};
+use messages::{BlockRequest, DataMessage, DataNodeMessage, StatusResponse};
 
 const MAX_INACTIVITY_DURATION: u64 = 4; // Máxima inactividad en segundos
-const NAMENODE_PORT: &str = "127.0.0.1:7878";
+const NAMENODE_PORT: usize = 7878;
 const API_PORT: usize = 8080;
 const VERIFICATION_INTERVAL: u64 = 8;
 // Lista predeterminada de claves válidas como constante global
@@ -22,6 +22,7 @@ pub struct DataNodeInfo {
     pub is_active: bool,
     pub port: usize,
     pub last_heartbeat: Instant,
+    pub block_ids: HashSet<String>,
 }
 
 #[derive(Debug)]
@@ -42,77 +43,77 @@ impl NameNode {
             valid_keys: valid_keys.unwrap_or(default_keys), // Usamos unwrap_or para usar la conversión
         }
     }
-
-    pub fn handle_client(&self, mut stream: TcpStream) {
-        // Buffer para leer los datos
+    // Method to communicate with DataNodes
+    pub async fn handle_datanodes(&self, mut stream: TcpStream) {
         loop {
-            let mut buffer = [0; 128];
-            match stream.read(&mut buffer) {
+            let mut buffer = vec![0; 128];
+            match stream.read(&mut buffer).await {
                 Ok(size) if size > 0 => {
                     let message = String::from_utf8_lossy(&buffer[..size]);
                     match serde_json::from_str::<DataNodeMessage>(&message) {
                         Ok(DataNodeMessage::Register { key }) => {
-                            let node_id = self.assign_id();
-                            self.register_node(key, &mut stream, node_id);
+                            let node_id = self.assign_id().await;
+                            self.register_node(key, &mut stream, node_id).await;
                         }
                         Ok(DataNodeMessage::Heartbeat { node_id }) => {
-                            self.receive_heartbeat(&mut stream, node_id);
+                            self.receive_heartbeat(&mut stream, node_id).await;
                         }
                         Err(_) => eprintln!("Mensaje inválido recibido: {}", message),
                     }
                 }
                 Ok(_) => {
                     println!("No hay datos de entrada");
-                    // Si `size == 0`, la conexión se cierra, así que salimos del loop
                     break;
                 }
                 Err(e) => {
                     eprintln!("Error al leer del stream: {}", e);
-                    break; // En caso de error, salimos del loop
+                    break;
                 }
             }
         }
     }
-    pub fn register_node(&self, key: String, stream: &mut TcpStream, node_id: u32) {
+
+    pub async fn register_node(&self, key: String, stream: &mut TcpStream, node_id: u32) {
         if !self.valid_keys.contains(&key) {
             eprintln!("Registro rechazado para {}: clave inválida", key);
-            let _ = stream.write_all(b"register_rejected:invalid_key\n");
+            let _ = stream.write_all(b"register_rejected:invalid_key\n").await;
             return;
         }
-        let mut nodes = self.nodes.lock().unwrap();
+        let mut nodes = self.nodes.lock().await;
         nodes.insert(
             node_id,
             DataNodeInfo {
                 is_active: true,
                 port: API_PORT + node_id as usize,
                 last_heartbeat: Instant::now(),
+                block_ids: HashSet::new(),
             },
         );
         println!("Node {} registrado con éxito!", node_id);
         let response = format!("register_accepted:{}", node_id);
-        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.write_all(response.as_bytes()).await;
     }
 
-    pub fn receive_heartbeat(&self, stream: &mut TcpStream, node_id: u32) {
-        let mut nodes = self.nodes.lock().unwrap();
+    pub async fn receive_heartbeat(&self, stream: &mut TcpStream, node_id: u32) {
+        let mut nodes = self.nodes.lock().await;
         if let Some(node) = nodes.get_mut(&node_id) {
             node.last_heartbeat = Instant::now();
             node.is_active = true;
             println!("Heartbeat recibido de Node {}.", node_id);
         }
         let response = format!("received_heartbeat:{}", node_id);
-        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.write_all(response.as_bytes()).await;
     }
 
-    pub fn assign_id(&self) -> u32 {
-        let mut next_id = self.next_id.lock().unwrap();
+    pub async fn assign_id(&self) -> u32 {
+        let mut next_id = self.next_id.lock().await;
         let id = *next_id;
         *next_id += 1; // Incrementar el ID para el siguiente nodo
         id
     }
 
-    pub fn check_nodes(&self) {
-        let mut nodes = self.nodes.lock().unwrap();
+    pub async fn check_nodes(&self) {
+        let mut nodes = self.nodes.lock().await;
         let now = Instant::now();
 
         for (node_id, node_info) in nodes.iter_mut() {
@@ -125,8 +126,11 @@ impl NameNode {
         }
     }
 
-    pub fn api_get_status(&self) -> HttpResponse {
-        let nodes = self.nodes.lock().unwrap();
+    // API FUNCTIONS.
+    // Communication with the client.
+    pub async fn api_get_status(&self) -> HttpResponse {
+        // Lock the nodes HashMap to read the data.
+        let nodes = self.nodes.lock().await;
         let mut status = Vec::new();
         for (node_id, node_info) in nodes.iter() {
             let status_message = if node_info.is_active {
@@ -134,68 +138,176 @@ impl NameNode {
             } else {
                 "inactive"
             };
+            // Push the status message to the vector.
             status.push(format!("Node {}: {}", node_id, status_message));
         }
-
+        // Liberar el Mutex antes de devolver la respuesta
+        drop(nodes);
+        // Return the status as JSON.
         HttpResponse::Ok().json(StatusResponse { status })
     }
+
     // Método para almacenar un bloque en el primer DataNode disponible
-    pub fn api_storeblock(&self, block_id: String) -> HttpResponse {
-        print!("ME METO AQUI");
-        let nodes = self.nodes.lock().unwrap();
-        print!("ME METO AQUI TAMBIEN");
+    pub async fn api_storeblock(&self, block_id: String) -> HttpResponse {
+        // Usamos un Mutex asíncrono para bloquear el acceso a la lista de nodos
+        let mut nodes = self.nodes.lock().await;
+
         // Buscar el primer DataNode activo
         let node_id = nodes
             .iter()
             .find(|(_, node_info)| node_info.is_active)
             .map(|(node_id, _)| *node_id);
 
+        // Cuando se encuentra un DataNode activo
         match node_id {
             Some(node_id) => {
-                let response = format!("Bloque {} almacenado en Node {}", block_id, node_id);
+                let response = format!("Bloque {} se almacena en Node {}", block_id, node_id);
 
                 // Crear un nuevo stream y enviar un mensaje al DataNode para almacenar el bloque
                 let datanode_port = nodes.get(&node_id).unwrap().port;
+                println!("Conectando al DataNode en el puerto {}", &datanode_port);
                 let datanode_address = format!("127.0.0.1:{}", datanode_port);
-                if let Ok(mut stream) = TcpStream::connect(datanode_address) {
-                    let data_message = DataMessage::StoreBlock {
-                        block_id: block_id.clone(),
-                        data: vec![0; 1024], // Datos de ejemplo
-                    };
-                    let message = serde_json::to_string(&data_message).unwrap();
-                    let _ = stream.write_all(message.as_bytes());
-                } else {
-                    return HttpResponse::InternalServerError()
-                        .json("No se pudo conectar con el DataNode");
+                match TcpStream::connect(datanode_address).await {
+                    Ok(mut stream) => {
+                        // Crear un mensaje de almacenamiento de bloque y enviarlo al DataNode
+                        if let Some(node_info) = nodes.get_mut(&node_id) {
+                            node_info.block_ids.insert(block_id.clone());
+                        }
+                        let data_message = DataMessage::StoreBlock {
+                            block_id: block_id.clone(),
+                            data: vec![0; 1024], // Datos de ejemplo
+                        };
+                        println!(
+                            "Almacenando bloque con ID: {} en el nodo {}",
+                            block_id, node_id
+                        );
+                        if let Some(node_info) = nodes.get_mut(&node_id) {
+                            node_info.block_ids.insert(block_id.clone());
+                        }
+                        let message = serde_json::to_string(&data_message).unwrap();
+                        if let Err(e) = stream.write_all(message.as_bytes()).await {
+                            eprintln!("Error al enviar el mensaje al DataNode: {}", e);
+                            return HttpResponse::InternalServerError()
+                                .json("Error al comunicar con el DataNode");
+                        }
+                        HttpResponse::Ok().json(response)
+                    }
+                    Err(e) => {
+                        eprintln!("Error al conectar con el DataNode: {}", e);
+                        HttpResponse::InternalServerError()
+                            .json("No se pudo conectar con el DataNode")
+                    }
                 }
-
-                HttpResponse::Ok().json(response)
             }
             None => HttpResponse::BadRequest()
                 .json("No hay nodos activos disponibles para almacenar el bloque"),
         }
     }
+    pub async fn api_readblock(&self, block_id: String) -> HttpResponse {
+        // Usamos un Mutex asíncrono para bloquear el acceso a la lista de nodos
+        let nodes = self.nodes.lock().await;
+
+        // Buscar el DataNode que contiene el bloque
+        let node_id = nodes
+            .iter()
+            .find(|(_, node_info)| node_info.block_ids.contains(&block_id))
+            .map(|(node_id, _)| *node_id);
+
+        match node_id {
+            Some(node_id) => {
+                println!(
+                    "Recuperando bloque con ID: {} del nodo {}",
+                    block_id, node_id
+                );
+
+                // Obtener la dirección del DataNode
+                let datanode_port = nodes.get(&node_id).unwrap().port;
+                let datanode_address = format!("127.0.0.1:{}", datanode_port);
+
+                // Intentar conectar al DataNode de manera asíncrona
+                match TcpStream::connect(datanode_address).await {
+                    Ok(mut stream) => {
+                        // Crear mensaje para leer el bloque
+                        let data_message = DataMessage::ReadBlock {
+                            block_id: block_id.clone(),
+                        };
+
+                        // Serializar el mensaje a JSON
+                        let message = serde_json::to_string(&data_message).unwrap();
+
+                        // Enviar el mensaje al DataNode
+                        if let Err(e) = stream.write_all(message.as_bytes()).await {
+                            eprintln!("Error al enviar el mensaje al DataNode: {}", e);
+                            return HttpResponse::InternalServerError()
+                                .json("Error al comunicar con el DataNode");
+                        }
+
+                        // Leer la respuesta del DataNode
+                        let mut buffer = Vec::new();
+                        if let Err(e) = stream.read_to_end(&mut buffer).await {
+                            eprintln!("Error al leer los datos del DataNode: {}", e);
+                            return HttpResponse::InternalServerError()
+                                .json("Error al leer el bloque del DataNode");
+                        }
+
+                        // Responder con los datos del bloque
+                        HttpResponse::Ok().body(buffer)
+                    }
+                    Err(e) => {
+                        // Error al conectar con el DataNode
+                        eprintln!("No se pudo conectar con el DataNode: {}", e);
+                        HttpResponse::InternalServerError()
+                            .json("No se pudo conectar con el DataNode")
+                    }
+                }
+            }
+            None => {
+                // Si no se encontró un DataNode con el bloque
+                println!("Bloque {} no encontrado en ningún DataNode", block_id);
+                println!(
+                    "Lista actual de bloques almacenados: {:?}",
+                    nodes
+                        .iter()
+                        .map(|(_, node_info)| &node_info.block_ids)
+                        .collect::<Vec<_>>()
+                );
+
+                // Responder con error 404
+                HttpResponse::NotFound().json(format!(
+                    "Bloque {} no encontrado en ningún DataNode",
+                    block_id
+                ))
+            }
+        }
+    }
 }
 
-pub fn start_namenode(namenode: web::Data<Arc<NameNode>>) {
+async fn start_namenode(namenode: web::Data<Arc<NameNode>>) {
     let namenode_clone = Arc::clone(&namenode);
 
-    // Iniciar el servidor TCP
-    let listener = TcpListener::bind(NAMENODE_PORT).expect("No se pudo iniciar el servidor");
+    // Iniciar el servidor TCP utilizando Tokio en lugar de std::thread
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", NAMENODE_PORT))
+        .await
+        .expect("No se pudo iniciar el servidor");
+
     println!("NameNode está escuchando....");
 
-    // Hilo para verificar nodos periódicamente
-    thread::spawn(move || loop {
-        thread::sleep(Duration::from_secs(VERIFICATION_INTERVAL));
-        namenode_clone.check_nodes();
+    // Tarea asíncrona para verificar nodos periódicamente
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(VERIFICATION_INTERVAL)).await;
+            namenode_clone.check_nodes().await;
+        }
     });
 
-    // Aceptar conexiones de DataNodes
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
+    // Aceptar conexiones de DataNodes de manera asíncrona
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => {
                 let namenode_clone = Arc::clone(&namenode);
-                thread::spawn(move || namenode_clone.handle_client(stream));
+                tokio::spawn(async move {
+                    namenode_clone.handle_datanodes(stream).await;
+                });
             }
             Err(e) => eprintln!("Error al aceptar conexión: {}", e),
         }
@@ -203,12 +315,29 @@ pub fn start_namenode(namenode: web::Data<Arc<NameNode>>) {
 }
 
 async fn api_get_status(namenode: web::Data<Arc<NameNode>>) -> HttpResponse {
-    namenode.api_get_status()
+    namenode.api_get_status().await
 }
 
-async fn api_post_storeblock(namenode: web::Data<Arc<NameNode>>, block_id: String) -> HttpResponse {
+async fn api_post_storeblock(
+    namenode: web::Data<Arc<NameNode>>,
+    payload: web::Json<BlockRequest>,
+) -> HttpResponse {
+    // Parsear el ID del bloque desde el cuerpo de la solicitud
+    let block_id = payload.block_id.clone();
     print!("Almacenando bloque con ID: {}", block_id);
-    namenode.api_storeblock(block_id.clone())
+    namenode.api_storeblock(block_id.clone()).await;
+    HttpResponse::Ok().json(format!("Bloque {} almacenado correctamente", block_id))
+}
+
+async fn api_get_readblock(
+    namenode: web::Data<Arc<NameNode>>,
+    query: web::Query<BlockRequest>,
+) -> HttpResponse {
+    let block_id = &query.block_id;
+
+    // Imprimir el block_id recibido
+    print!("Recuperando bloque con ID: {}", block_id);
+    namenode.api_readblock(block_id.clone()).await
 }
 
 async fn run_api_server(namenode: web::Data<Arc<NameNode>>) {
@@ -217,6 +346,7 @@ async fn run_api_server(namenode: web::Data<Arc<NameNode>>) {
             .app_data(namenode.clone()) // Agrega el Arc<NameNode> a las rutas
             .route("/status", web::get().to(api_get_status))
             .route("/storeblock", web::post().to(api_post_storeblock)) // Agregar la ruta para almacenar bloques
+            .route("/readblock", web::get().to(api_get_readblock)) // Agregar la ruta para recuperar el contenido de los bloques
     })
     .bind(format!("127.0.0.1:{}", API_PORT))
     .expect("Unable to start API server")
@@ -225,18 +355,22 @@ async fn run_api_server(namenode: web::Data<Arc<NameNode>>) {
     .expect("Failed to run API server");
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     // Crear una instancia de NameNode
-    let namenode = Arc::new(NameNode::new(None)); // Puedes pasar claves si es necesario.
+    let namenode = Arc::new(NameNode::new(None)); // Si es necesario, puedes pasar claves al constructor
 
     // Si solo quieres iniciar el servidor NameNode (sin API):
     let namenode_clone = Arc::clone(&namenode);
-    thread::spawn(move || {
-        start_namenode(web::Data::new(namenode_clone));
+
+    // Iniciar servidor NameNode en un hilo separado usando Tokio
+    tokio::spawn(async move {
+        start_namenode(web::Data::new(namenode_clone)).await;
     });
 
-    // Si deseas iniciar la API junto con NameNode:
-    // Descomenta las siguientes líneas
+    // Iniciar el servidor API (si es necesario junto con el servidor NameNode):
     let namenode_clone = Arc::clone(&namenode);
-    actix_rt::System::new().block_on(run_api_server(web::Data::new(namenode_clone)));
+
+    // Ejecutar el servidor Actix Web
+    run_api_server(web::Data::new(namenode_clone)).await;
 }
