@@ -1,7 +1,6 @@
 mod blockdata;
 mod messages;
 
-
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -104,52 +103,72 @@ impl DataNode {
         Some(listener)
     }
 
-     // Método para manejar la conexión de un cliente
-     async fn handle_connection(&mut self, mut stream: tokio::net::TcpStream) {
-        let mut buffer = Vec::new();
-        
-        // Intentamos leer los datos del stream
-        if let Err(e) = stream.read_to_end(&mut buffer).await {
-            eprintln!("Error al leer datos del stream: {}", e);
-            return;
-        }
+    async fn handle_connection(&mut self, mut stream: tokio::net::TcpStream) {
+        let mut buffer = vec![0; 2048];
 
-        // Intentamos deserializar el mensaje recibido
-        match serde_json::from_slice::<DataMessage>(&buffer) {
-            Ok(DataMessage::StoreBlock { block_id, data }) => {
-                println!(
-                    "Bloque recibido: ID: {}, Tamaño de los datos: {} bytes",
-                    block_id,
-                    data.len()
-                );
-                // Almacenar el bloque
-                self.store_block(block_id, &data).await;
-            }
-            Ok(DataMessage::ReadBlock { block_id }) => {
-                println!("Se solicita el bloque con ID: {}", block_id);
-                
-                // Enviar el bloque solicitado
-                match self.send_block(block_id).await {
-                    Ok(data) => {
-                        let response_message = DataNodeMessage::BlockData { data };
-                        match serde_json::to_string(&response_message) {
-                            Ok(serialized) => {
-                                if let Err(e) = stream.write_all(serialized.as_bytes()).await {
-                                    eprintln!("Error al enviar el mensaje de respuesta: {}", e);
+        // Intentamos leer los datos del stream
+        match stream.read(&mut buffer).await {
+            Ok(n @ 1..) => {
+                println!("Se leyeron {} bytes del stream", n);
+                let data = &buffer[..n]; // Recortamos el buffer a los datos válidos
+
+                // Intentamos deserializar el mensaje recibido
+                match serde_json::from_slice::<DataMessage>(data) {
+                    Ok(DataMessage::StoreBlock { block_id, data }) => {
+                        println!(
+                            "Bloque recibido: ID: {}, Tamaño de los datos: {} bytes",
+                            block_id,
+                            data.len()
+                        );
+                        // Almacenar el bloque
+                        self.store_block(block_id, &data).await;
+                    }
+                    Ok(DataMessage::ReadBlock { block_id }) => {
+                        println!("Se solicita el bloque con ID: {}", block_id);
+
+                        // Enviar el bloque solicitado
+                        match self.send_block(block_id).await {
+                            Ok(data) => {
+                                let response_message = DataNodeMessage::BlockData { data };
+                                match serde_json::to_string(&response_message) {
+                                    Ok(serialized) => {
+                                        if let Err(e) =
+                                            stream.write_all(serialized.as_bytes()).await
+                                        {
+                                            eprintln!(
+                                                "Error al enviar el mensaje de respuesta: {}",
+                                                e
+                                            );
+                                        } else if let Err(e) = stream.flush().await {
+                                            eprintln!(
+                                                "Error al vaciar el stream después del envío: {}",
+                                                e
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "Error al serializar el mensaje de respuesta: {}",
+                                            e
+                                        );
+                                    }
                                 }
                             }
                             Err(e) => {
-                                eprintln!("Error al serializar el mensaje de respuesta: {}", e);
+                                eprintln!("Error al enviar el bloque: {}", e);
                             }
                         }
                     }
                     Err(e) => {
-                        eprintln!("Error al enviar el bloque: {}", e);
+                        eprintln!("Error al deserializar el mensaje: {}", e);
                     }
                 }
             }
+            Ok(0) => {
+                eprintln!("La conexión se cerró por el cliente");
+            }
             Err(e) => {
-                eprintln!("Error al deserializar el mensaje: {}", e);
+                eprintln!("Error al leer datos del stream: {}", e);
             }
         }
     }
@@ -265,8 +284,6 @@ impl DataNode {
             Err(err_msg)
         }
     }
-
-    
 }
 
 #[tokio::main]
@@ -291,7 +308,6 @@ async fn main() {
         datanode_guard.start_listening().await
     };
 
-  
     // Tarea asíncrona para enviar el heartbeat
     let datanode_clone_heartbeat = Arc::clone(&datanode);
     let heartbeat_handler = tokio::spawn(async move {
@@ -301,7 +317,7 @@ async fn main() {
             sleep(Duration::from_secs(1)).await; // Espera 1 segundo antes de enviar el siguiente heartbeat
         }
     });
-    
+
     // Tarea asíncrona para escuchar conexiones
     let datanode_clone_connections = Arc::clone(&datanode);
     let connection_handle = tokio::spawn(async move {
@@ -324,7 +340,5 @@ async fn main() {
             sleep(Duration::from_secs(1)).await; // Espera antes de aceptar la siguiente conexión
         }
     });
-    let _ = tokio::join!(heartbeat_handler, connection_handle); 
-    
-    
+    let _ = tokio::join!(heartbeat_handler, connection_handle);
 }

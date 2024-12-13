@@ -8,7 +8,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
 
-use messages::{BlockRequest, DataMessage, DataNodeMessage, StatusResponse};
+use messages::{BlockReadRequest, BlockStoreRequest, DataMessage, DataNodeMessage, StatusResponse};
 
 const MAX_INACTIVITY_DURATION: u64 = 4; // Máxima inactividad en segundos
 const NAMENODE_PORT: usize = 7878;
@@ -153,7 +153,7 @@ impl NameNode {
     }
 
     // Método para almacenar un bloque en el primer DataNode disponible
-    pub async fn api_storeblock(&self, block_id: String) -> HttpResponse {
+    pub async fn api_storeblock(&self, block_id: String, message: String) -> HttpResponse {
         // Usamos un Mutex asíncrono para bloquear el acceso a la lista de nodos
         let mut nodes = self.nodes.lock().await;
 
@@ -180,7 +180,7 @@ impl NameNode {
                         }
                         let data_message = DataMessage::StoreBlock {
                             block_id: block_id.clone(),
-                            data: vec![0; 1024], // Datos de ejemplo
+                            data: message.into_bytes(),
                         };
                         println!(
                             "Almacenando bloque con ID: {} en el nodo {}",
@@ -259,8 +259,60 @@ impl NameNode {
                             println!("Datos leídos del DataNode");
                         }
 
-                        // Responder con los datos del bloque
-                        HttpResponse::Ok().body(buffer)
+                        // Intentamos deserializar el buffer como un valor JSON genérico
+                        match serde_json::from_slice::<serde_json::Value>(&buffer) {
+                            Ok(json) => {
+                                // Acceder al campo "BlockData" dentro del JSON
+                                if let Some(block_data) = json.get("BlockData") {
+                                    // Acceder al campo "data" que es un arreglo de bytes
+                                    if let Some(data) = block_data.get("data") {
+                                        // Intentamos convertir el arreglo de bytes (Vec<u8>) en un String
+                                        if let Some(bytes) = data.as_array() {
+                                            let byte_values: Vec<u8> = bytes
+                                                .iter()
+                                                .filter_map(|v| v.as_u64())
+                                                .map(|v| v as u8)
+                                                .collect();
+
+                                            match String::from_utf8(byte_values) {
+                                                Ok(string_data) => {
+                                                    // Responder con los datos convertidos a String
+                                                    return HttpResponse::Ok().body(string_data);
+                                                }
+                                                Err(e) => {
+                                                    eprintln!(
+                                                        "Error al convertir los datos a String: {}",
+                                                        e
+                                                    );
+                                                    return HttpResponse::InternalServerError()
+                                                        .body(
+                                                        "Error al convertir los datos   a String",
+                                                    );
+                                                }
+                                            }
+                                        } else {
+                                            eprintln!(
+                                                "El campo 'data' no es un arreglo de bytes válido."
+                                            );
+                                            return HttpResponse::BadRequest().body("El campo 'data' no es un arreglo de bytes   válido.");
+                                        }
+                                    } else {
+                                        eprintln!("No se encontró el campo 'data' en BlockData.");
+                                        return HttpResponse::BadRequest()
+                                            .body("No se encontró el campo 'data' en BlockData.");
+                                    }
+                                } else {
+                                    eprintln!("No se encontró 'BlockData' en el mensaje.");
+                                    return HttpResponse::BadRequest()
+                                        .body("No se encontró 'BlockData' en el mensaje.");
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("Error al deserializar el mensaje: {}", e);
+                                return HttpResponse::InternalServerError()
+                                    .body("Error al deserializar el mensaje.");
+                            }
+                        }
                     }
                     Err(e) => {
                         // Error al conectar con el DataNode
@@ -329,18 +381,19 @@ async fn api_get_status(namenode: web::Data<Arc<NameNode>>) -> HttpResponse {
 
 async fn api_post_storeblock(
     namenode: web::Data<Arc<NameNode>>,
-    payload: web::Json<BlockRequest>,
+    payload: web::Json<BlockStoreRequest>,
 ) -> HttpResponse {
     // Parsear el ID del bloque desde el cuerpo de la solicitud
     let block_id = payload.block_id.clone();
+    let message = payload.message.clone();
     print!("Almacenando bloque con ID: {}", block_id);
-    namenode.api_storeblock(block_id.clone()).await;
+    namenode.api_storeblock(block_id.clone(), message).await;
     HttpResponse::Ok().json(format!("Bloque {} almacenado correctamente", block_id))
 }
 
 async fn api_get_readblock(
     namenode: web::Data<Arc<NameNode>>,
-    query: web::Query<BlockRequest>,
+    query: web::Query<BlockReadRequest>,
 ) -> HttpResponse {
     let block_id = &query.block_id;
 

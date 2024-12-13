@@ -19,6 +19,12 @@ pub struct StatusResponse {
 }
 
 #[derive(Deserialize)]
-pub struct BlockRequest {
+pub struct BlockStoreRequest {
+    pub block_id: String,
+    pub message: String,
+}
+
+#[derive(Deserialize)]
+pub struct BlockReadRequest {
     pub block_id: String,
 }
