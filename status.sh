@@ -1,0 +1,4 @@
+RESPONSE=$(curl http://127.0.0.1:8080/status)
+# HACER UNA PETICION Y DEVOLVER LA RESPUESTA
+echo "$RESPONSE"
+exit 0

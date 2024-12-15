@@ -31,7 +31,10 @@ pub struct NameNode {
     pub nodes: Arc<Mutex<HashMap<u32, DataNodeInfo>>>,
     pub partitions: Arc<Mutex<HashMap<u32, PartitionInfo>>>, // Cambiado a u32 para partition_id
     pub next_id: Arc<Mutex<u32>>,
+    pub next_node_id: Arc<Mutex<u32>>,
     pub valid_keys: HashSet<String>,
+    pub replication_factor: usize,
+
 }
 
 #[derive(Debug, Clone)]
@@ -43,15 +46,17 @@ pub struct DataNodeInfo {
 }
 
 impl NameNode {
-    pub fn new(valid_keys: Option<HashSet<String>>) -> Self {
+    pub fn new(valid_keys: Option<HashSet<String>>, replication_factor:Option<usize>) -> Self {
         // Convertimos DEFAULT_KEYS en Vec<String> para el campo valid_keys
         let default_keys: HashSet<String> = DEFAULT_KEYS.iter().map(|&s| s.to_string()).collect();
-
+        let replication_factor = replication_factor.unwrap_or(REPLICATION_FACTOR);
         Self {
             nodes: Arc::new(Mutex::new(HashMap::new())),
             partitions: Arc::new(Mutex::new(HashMap::new())),
             next_id: Arc::new(Mutex::new(1)), // El primer ID será 1
+            next_node_id: Arc::new(Mutex::new(1)), // El primer ID será 1
             valid_keys: valid_keys.unwrap_or(default_keys), // Usamos unwrap_or para usar la conversión
+            replication_factor,
         }
     }
     // Method to communicate with DataNodes
@@ -201,16 +206,29 @@ impl NameNode {
             println!("Partición {}: tamaño {} bytes", i, partition.len());
         }
 
+
+        // Round Robin para seleccionar los nodos
+        // Se seleccionan los primeros N nodos activos
         let node_ids_and_ports: Vec<(u32, usize)> = {
             let nodes = self.nodes.lock().await;
-
+            let next_node_id = *self.next_node_id.lock().await;
             // Buscar los primeros N nodos activos y obtener sus IDs y puertos
-            nodes
-                .iter()
-                .filter(|(_, node_info)| node_info.is_active)
-                .take(REPLICATION_FACTOR)
-                .map(|(node_id, node_info)| (*node_id, node_info.port))
-                .collect()
+            let nodes_ports = nodes.iter()
+            .filter(|(_node_id, node_info)| node_info.is_active)
+        .map(|(node_id, node_info)| (*node_id, node_info.port))
+        .skip_while(|(node_id, _)| *node_id < next_node_id)
+        .take(self.replication_factor)
+        .collect();
+
+        //POner el next_node_id en el siguiente nodo
+        *self.next_node_id.lock().await = next_node_id + self.replication_factor  as u32;
+        if next_node_id + self.replication_factor as u32 > nodes.len() as u32 {
+            *self.next_node_id.lock().await = 1;
+        } else {
+            *self.next_node_id.lock().await = next_node_id +self.replication_factor  as u32;
+        }
+
+        nodes_ports
         }; // El Mutex se desbloquea aquí
 
         // Verificamos si tenemos al menos REPLICATION_FACTOR nodos activos
@@ -627,8 +645,16 @@ async fn run_api_server(namenode: web::Data<Arc<NameNode>>) {
 
 #[tokio::main]
 async fn main() {
-    // Crear una instancia de NameNode
-    let namenode = Arc::new(NameNode::new(None)); // Si es necesario, puedes pasar claves al constructor
+    // Obtener el factor de replicación desde los argumentos de la línea de comandos
+    let args: Vec<String> = std::env::args().collect();
+    let replication_factor = if args.len() > 1 {
+        args[1].parse::<usize>().unwrap_or(REPLICATION_FACTOR)
+    } else {
+        REPLICATION_FACTOR
+    };
+
+    // Crear una instancia de NameNode con el factor de replicación especificado
+    let namenode = Arc::new(NameNode::new(None, Some(replication_factor)));
 
     // Si solo quieres iniciar el servidor NameNode (sin API):
     let namenode_clone = Arc::clone(&namenode);
