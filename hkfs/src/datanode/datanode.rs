@@ -18,7 +18,7 @@ const API_PORT: usize = 8080;
 
 #[derive(Debug, Clone)]
 struct BlockDataInfo {
-    block_id: String,
+    id_block: u32,
     path: String,
 }
 
@@ -103,85 +103,92 @@ impl DataNode {
         Some(listener)
     }
 
-    async fn handle_connection(&mut self, mut stream: tokio::net::TcpStream) {
-        let mut buffer = vec![0; 2048];
+    async fn handle_connection(&mut self, mut stream: TcpStream) {
+        let (mut read_half, mut write_half) = stream.split();
 
-        // Intentamos leer los datos del stream
-        match stream.read(&mut buffer).await {
-            Ok(n @ 1..) => {
-                println!("Se leyeron {} bytes del stream", n);
-                let data = &buffer[..n]; // Recortamos el buffer a los datos válidos
+        let mut buffer = Vec::new();
+        let mut temp_buffer = vec![0; 1024];
 
-                // Intentamos deserializar el mensaje recibido
-                match serde_json::from_slice::<DataMessage>(data) {
-                    Ok(DataMessage::StoreBlock { block_id, data }) => {
-                        println!(
-                            "Bloque recibido: ID: {}, Tamaño de los datos: {} bytes",
-                            block_id,
-                            data.len()
-                        );
-                        // Almacenar el bloque
-                        self.store_block(block_id, &data).await;
+        loop {
+            match read_half.read(&mut temp_buffer).await {
+                Ok(0) => break, // Fin de la conexión
+                Ok(n) => {
+                    buffer.extend_from_slice(&temp_buffer[..n]);
+                    // Intentar deserializar el JSON con el buffer acumulado
+                match serde_json::from_slice::<DataMessage>(&buffer) {
+                    Ok(_) => {
+                        // Si la deserialización es exitosa, hemos recibido el mensaje completo
+                        break;
                     }
-                    Ok(DataMessage::ReadBlock { block_id }) => {
-                        println!("Se solicita el bloque con ID: {}", block_id);
+                    Err(_) => {
+                        // Si la deserialización falla, significa que aún no tenemos un mensaje completo
+                        // Continuar leyendo más datos
+                    }
+                }
+                }
+                Err(e) => {
+                    eprintln!("Error al leer del stream: {}", e);
+                    return;
+                }
+            }
+        }
 
-                        // Enviar el bloque solicitado
-                        match self.send_block(block_id).await {
-                            Ok(data) => {
-                                let response_message = DataNodeMessage::BlockData { data };
-                                match serde_json::to_string(&response_message) {
-                                    Ok(serialized) => {
-                                        if let Err(e) =
-                                            stream.write_all(serialized.as_bytes()).await
-                                        {
-                                            eprintln!(
-                                                "Error al enviar el mensaje de respuesta: {}",
-                                                e
-                                            );
-                                        } else if let Err(e) = stream.flush().await {
-                                            eprintln!(
-                                                "Error al vaciar el stream después del envío: {}",
-                                                e
-                                            );
-                                        }
-                                    }
-                                    Err(e) => {
-                                        eprintln!(
-                                            "Error al serializar el mensaje de respuesta: {}",
-                                            e
-                                        );
-                                    }
+        match serde_json::from_slice::<DataMessage>(&buffer) {
+            Ok(DataMessage::StoreBlock { block_id, data }) => {
+                println!(
+                    "Bloque recibido: ID: {}, Tamaño de los datos: {} bytes",
+                    block_id,
+                    data.len()
+                );
+                // Almacenar el bloque
+                self.store_block(block_id, &data).await;
+            }
+            Ok(DataMessage::ReadBlock { block_id }) => {
+                println!("Se solicita el bloque con ID: {}", block_id);
+
+                // Enviar el bloque solicitado
+                match self.send_block(block_id).await {
+                    Ok(data) => {
+                        let response_message = DataNodeMessage::BlockData { data };
+                        match serde_json::to_string(&response_message) {
+                            Ok(serialized) => {
+                                if let Err(e) = write_half.write_all(serialized.as_bytes()).await {
+                                    eprintln!("Error al enviar el mensaje de respuesta: {}", e);
+                                } else if let Err(e) = write_half.flush().await {
+                                    eprintln!("Error al vaciar el stream después del envío: {}", e);
+                                }
+
+                                // Cerrar el write_half explícitamente
+                                if let Err(e) = write_half.shutdown().await {
+                                    eprintln!("Error al cerrar el write_half: {}", e);
                                 }
                             }
                             Err(e) => {
-                                eprintln!("Error al enviar el bloque: {}", e);
+                                eprintln!("Error al serializar el mensaje de respuesta: {}", e);
                             }
                         }
                     }
                     Err(e) => {
-                        eprintln!("Error al deserializar el mensaje: {}", e);
+                        eprintln!("Error al enviar el bloque: {}", e);
                     }
                 }
             }
-            Ok(0) => {
-                eprintln!("La conexión se cerró por el cliente");
-            }
             Err(e) => {
-                eprintln!("Error al leer datos del stream: {}", e);
+                eprintln!("Error al deserializar el mensaje: {}", e);
             }
         }
     }
+
     // Método para simular el almacenamiento de un bloque
-    async fn store_block(&mut self, block_id: String, data: &[u8]) {
+    async fn store_block(&mut self, block_id: u32, data: &[u8]) {
         println!("Almacenando bloque con ID {}. Datos: {:?}", block_id, data);
 
-        let path = format!("{}/{}/", DATA_PATH, block_id);
-        let block = BlockData::new(block_id.clone(), path.clone());
+        let path = format!("{}/{}/{}/", DATA_PATH, self.id.unwrap(), block_id);
+        let block = BlockData::new(block_id, path.clone());
         let _ = block.store_block(PARTITION_SIZE, data.to_vec()).await;
 
         let block_info = BlockDataInfo {
-            block_id: block_id.clone(),
+            id_block: block_id,
             path: path.clone(),
         };
 
@@ -245,21 +252,21 @@ impl DataNode {
         }
     }
 
-    async fn send_block(&mut self, block_id: String) -> Result<Vec<u8>, String> {
+    async fn send_block(&mut self, block_id: u32) -> Result<Vec<u8>, String> {
         println!("Checando bloques...");
 
         if let Some(blocks) = &self.blocks {
             // Buscar el bloque con el ID proporcionado
-            if let Some(block_info) = blocks.iter().find(|b| b.block_id == block_id) {
-                let mut block = BlockData {
-                    block_id: block_info.block_id.clone(),
+            if let Some(block_info) = blocks.iter().find(|b| b.id_block == block_id) {
+                let mut blockdata = BlockData {
+                    block_id: block_info.id_block,
                     path: block_info.path.clone(),
                 };
 
-                println!("Bloque encontrado: {}", block_info.block_id);
+                println!("Bloque encontrado: {}", block_info.id_block);
 
                 // Intentar cargar los datos del bloque con un timeout
-                match timeout(Duration::from_secs(10), block.load_block()).await {
+                match timeout(Duration::from_secs(10), blockdata.load_block()).await {
                     Ok(Ok(data)) => {
                         println!("Bloque cargado correctamente.");
                         Ok(data)
@@ -326,8 +333,11 @@ async fn main() {
                 // Esperamos a que lleguen conexiones
                 match listener.accept().await {
                     Ok((stream, _)) => {
-                        let mut datanode_guard = datanode_clone_connections.lock().await;
-                        datanode_guard.handle_connection(stream).await;
+                        let datanode_clone = Arc::clone(&datanode_clone_connections);
+                        tokio::spawn(async move {
+                            let mut datanode_guard = datanode_clone.lock().await;
+                            datanode_guard.handle_connection(stream).await;
+                        });
                     }
                     Err(e) => {
                         eprintln!("Error al aceptar conexión: {}", e);

@@ -6,13 +6,13 @@ use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 
 pub struct BlockData {
-    pub block_id: String,
+    pub block_id: u32,
     pub path: String,
 }
 
 impl BlockData {
     /// Crea una nueva instancia de `BlockData`.
-    pub fn new(block_id: String, path: String) -> Self {
+    pub fn new(block_id:u32, path: String) -> Self {
         Self { block_id, path }
     }
 

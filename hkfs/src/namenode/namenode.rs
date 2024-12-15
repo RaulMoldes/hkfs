@@ -1,6 +1,8 @@
 mod messages;
 
 use actix_web::{web, App, HttpResponse, HttpServer};
+use futures::future::join_all;
+use messages::{DataMessage, DataNodeMessage, GetRequest, PostRequest, Response};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -8,28 +10,36 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
 
-use messages::{BlockReadRequest, BlockStoreRequest, DataMessage, DataNodeMessage, StatusResponse};
-
+const REPLICATION_FACTOR: usize = 3; // Factor de replicación
 const MAX_INACTIVITY_DURATION: u64 = 4; // Máxima inactividad en segundos
 const NAMENODE_PORT: usize = 7878;
 const API_PORT: usize = 8080;
+const PARTITION_SIZE: usize = 1024; // Tamaño máximo de la partición
 const VERIFICATION_INTERVAL: u64 = 8;
 // Lista predeterminada de claves válidas como constante global
 const DEFAULT_KEYS: &[&str] = &["SBXBUSKANKLAKA"];
 
-#[derive(Debug)]
-pub struct DataNodeInfo {
-    pub is_active: bool,
-    pub port: usize,
-    pub last_heartbeat: Instant,
-    pub block_ids: HashSet<String>,
+#[derive(Clone, Debug)]
+pub struct PartitionInfo {
+    pub node: u32,
+    pub block: u32,     // Cambiado a u32
+    pub partition: u32, // Cambiado a u32
 }
 
 #[derive(Debug)]
 pub struct NameNode {
     pub nodes: Arc<Mutex<HashMap<u32, DataNodeInfo>>>,
-    pub next_id: Arc<Mutex<u32>>, // Contador de IDs únicos
+    pub partitions: Arc<Mutex<HashMap<u32, PartitionInfo>>>, // Cambiado a u32 para partition_id
+    pub next_id: Arc<Mutex<u32>>,
     pub valid_keys: HashSet<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DataNodeInfo {
+    pub is_active: bool,
+    pub port: usize,
+    pub last_heartbeat: Instant,
+    pub block_ids: HashSet<u32>,
 }
 
 impl NameNode {
@@ -39,6 +49,7 @@ impl NameNode {
 
         Self {
             nodes: Arc::new(Mutex::new(HashMap::new())),
+            partitions: Arc::new(Mutex::new(HashMap::new())),
             next_id: Arc::new(Mutex::new(1)), // El primer ID será 1
             valid_keys: valid_keys.unwrap_or(default_keys), // Usamos unwrap_or para usar la conversión
         }
@@ -131,6 +142,31 @@ impl NameNode {
         }
     }
 
+    pub async fn partition_block(data: Vec<u8>, partition_size: usize) -> Vec<Vec<u8>> {
+        // Validación: Si el tamaño de la partición es 0, devolvemos un vector vacío.
+        if partition_size == 0 {
+            eprintln!("Error: El tamaño de la partición no puede ser 0.");
+            return Vec::new();
+        }
+
+        // Si los datos están vacíos, devolvemos un vector vacío.
+        if data.is_empty() {
+            eprintln!("Advertencia: Los datos están vacíos, no se crearán particiones.");
+            return Vec::new();
+        }
+
+        let mut partitions = Vec::new();
+        let mut start = 0;
+
+        while start < data.len() {
+            let end = std::cmp::min(start + partition_size, data.len());
+            partitions.push(data[start..end].to_vec());
+            start = end;
+        }
+
+        partitions
+    }
+
     // API FUNCTIONS.
     // Communication with the client.
     pub async fn api_get_status(&self) -> HttpResponse {
@@ -149,197 +185,321 @@ impl NameNode {
         // Liberar el Mutex antes de devolver la respuesta
         drop(nodes);
         // Return the status as JSON.
-        HttpResponse::Ok().json(StatusResponse { status })
+        HttpResponse::Ok().json(Response::Status { status })
+    }
+    pub async fn api_storeblock(&self, block_id: u32, message: String) -> HttpResponse {
+        let data = message.into_bytes(); // Convertir el mensaje a bytes
+        println!("ENTRO A LA FUNCION api_storeblock");
+        // Si el tamaño del bloque es mayor que 1 KB, particionamos
+        let partitions = if data.len() > PARTITION_SIZE {
+            println!("El bloque es demasiado grande, particionando...");
+            NameNode::partition_block(data, PARTITION_SIZE).await
+        } else {
+            vec![data] // Si no es mayor que 1 KB, solo lo enviamos entero
+        };
+        for (i, partition) in partitions.iter().enumerate() {
+            println!("Partición {}: tamaño {} bytes", i, partition.len());
+        }
+
+        let node_ids_and_ports: Vec<(u32, usize)> = {
+            let nodes = self.nodes.lock().await;
+
+            // Buscar los primeros N nodos activos y obtener sus IDs y puertos
+            nodes
+                .iter()
+                .filter(|(_, node_info)| node_info.is_active)
+                .take(REPLICATION_FACTOR)
+                .map(|(node_id, node_info)| (*node_id, node_info.port))
+                .collect()
+        }; // El Mutex se desbloquea aquí
+
+        // Verificamos si tenemos al menos REPLICATION_FACTOR nodos activos
+        if node_ids_and_ports.len() < REPLICATION_FACTOR {
+            return HttpResponse::BadRequest().json(Response::Error {
+                message:
+                    "No hay suficientes DataNodes activos disponibles para replicar la partición"
+                        .to_string(),
+            });
+        }
+        // Crear la lista de futuros
+        let store_futures = partitions.iter().enumerate().flat_map(|(i, partition)| {
+            // Generar un id único para cada partición
+            let partition_id = block_id * 1000 + i as u32;
+            println!(
+                "Almacenando partición {} del bloque {}",
+                partition_id, block_id
+            );
+
+            // Iterar sobre cada combinación de (node_id, port) con la partición
+            node_ids_and_ports.iter().map(move |(node_id, port)| {
+                // Clonar los valores para moverlos al bloque async
+                let port = *port;
+                println!(
+                    "Almacenando partición {} en el nodo {}",
+                    partition_id, node_id
+                );
+                // Llamar a store_partition con el nodo y la partición correspondiente
+                self.store_partition(
+                    *node_id,
+                    "127.0.0.1".to_string(),
+                    port,
+                    block_id,
+                    partition_id,
+                    partition.clone(),
+                )
+            })
+        });
+        // Ejecutar todas las tareas en paralelo y esperar sus resultados
+        let responses = join_all(store_futures).await;
+
+        // Verificar si alguna de las respuestas contiene un error
+        if responses
+            .iter()
+            .any(|response| response.status().is_server_error())
+        {
+            return HttpResponse::InternalServerError().json(Response::Error {
+                message: "Error al almacenar particiones".to_string(),
+            });
+        }
+
+        HttpResponse::Ok().json(Response::Ok {
+            message: format!("Bloque {} almacenado y particionado.", block_id),
+        })
     }
 
-    // Método para almacenar un bloque en el primer DataNode disponible
-    pub async fn api_storeblock(&self, block_id: String, message: String) -> HttpResponse {
-        // Usamos un Mutex asíncrono para bloquear el acceso a la lista de nodos
-        let mut nodes = self.nodes.lock().await;
+    pub async fn store_partition(
+        &self,
+        datanode_id: u32,     // Recibe el ID del DataNode
+        datanode_ip: String,  // Recibe la IP del DataNode
+        datanode_port: usize, // Recibe el puerto del DataNode
+        block_id: u32,
+        partition_id: u32,
+        data: Vec<u8>,
+    ) -> HttpResponse {
+        println!(
+            "Entrando a store_partition con IP: {}, Puerto: {}, block_id: {}, partition_id: {}",
+            datanode_ip, datanode_port, block_id, partition_id
+        );
 
-        // Buscar el primer DataNode activo
-        let node_id = nodes
-            .iter()
-            .find(|(_, node_info)| node_info.is_active)
-            .map(|(node_id, _)| *node_id);
+        // Almacenar la información de la partición en el NameNode
+        {
+            let mut partitions = self.partitions.lock().await;
+            partitions.insert(
+                partition_id,
+                PartitionInfo {
+                    node: datanode_id, // Si es necesario, reemplaza con el ID del nodo o usa un valor adecuado
+                    partition: partition_id,
+                    block: block_id,
+                },
+            );
+        }
+        println!("Información de la partición almacenada en el NameNode");
 
-        // Cuando se encuentra un DataNode activo
-        match node_id {
-            Some(node_id) => {
-                let response = format!("Bloque {} se almacena en Node {}", block_id, node_id);
+        // Intentar conectar y enviar datos al DataNode seleccionado
+        let datanode_address = format!("{}:{}", datanode_ip, datanode_port);
+        println!("Conectando al DataNode en {}", datanode_address);
 
-                // Crear un nuevo stream y enviar un mensaje al DataNode para almacenar el bloque
-                let datanode_port = nodes.get(&node_id).unwrap().port;
-                println!("Conectando al DataNode en el puerto {}", &datanode_port);
-                let datanode_address = format!("127.0.0.1:{}", datanode_port);
-                match TcpStream::connect(datanode_address).await {
-                    Ok(mut stream) => {
-                        // Crear un mensaje de almacenamiento de bloque y enviarlo al DataNode
-                        if let Some(node_info) = nodes.get_mut(&node_id) {
-                            node_info.block_ids.insert(block_id.clone());
-                        }
-                        let data_message = DataMessage::StoreBlock {
-                            block_id: block_id.clone(),
-                            data: message.into_bytes(),
-                        };
-                        println!(
-                            "Almacenando bloque con ID: {} en el nodo {}",
-                            block_id, node_id
-                        );
-                        if let Some(node_info) = nodes.get_mut(&node_id) {
-                            node_info.block_ids.insert(block_id.clone());
-                        }
-                        let message = serde_json::to_string(&data_message).unwrap();
-                        if let Err(e) = stream.write_all(message.as_bytes()).await {
-                            eprintln!("Error al enviar el mensaje al DataNode: {}", e);
-                            return HttpResponse::InternalServerError()
-                                .json("Error al comunicar con el DataNode");
-                        }
-                        HttpResponse::Ok().json(response)
-                    }
-                    Err(e) => {
-                        eprintln!("Error al conectar con el DataNode: {}", e);
-                        HttpResponse::InternalServerError()
-                            .json("No se pudo conectar con el DataNode")
-                    }
+        match TcpStream::connect(&datanode_address).await {
+            Ok(mut stream) => {
+                let data_message = DataMessage::StoreBlock {
+                    block_id: partition_id,
+                    data: data.clone(),
+                };
+                println!("Conexión exitosa al DataNode {}", datanode_address);
+
+                let message = serde_json::to_string(&data_message).unwrap();
+                println!("Tamaño del mensaje: {} bytes", message.len());
+                if let Err(e) = stream.write_all(message.as_bytes()).await {
+                    eprintln!(
+                        "Error al enviar la partición {} al DataNode {}: {}",
+                        partition_id, datanode_address, e
+                    );
+                    return HttpResponse::InternalServerError().json(Response::Error {
+                        message: format!("Error al comunicar con el DataNode {}", datanode_address),
+                    });
                 }
+
+                println!(
+                    "Partición {} del bloque {} replicada en el nodo {}",
+                    partition_id, block_id, datanode_address
+                );
+                HttpResponse::Ok().json(Response::Ok {
+                    message: format!(
+                        "Partición {} del bloque {} almacenada en el nodo {}",
+                        partition_id, block_id, datanode_address
+                    ),
+                })
             }
-            None => HttpResponse::BadRequest()
-                .json("No hay nodos activos disponibles para almacenar el bloque"),
+            Err(e) => {
+                eprintln!(
+                    "Error al conectar con el DataNode {}: {}",
+                    datanode_address, e
+                );
+                HttpResponse::InternalServerError().json(Response::Error {
+                    message: format!("No se pudo conectar con el DataNode {}", datanode_address),
+                })
+            }
         }
     }
-    pub async fn api_readblock(&self, block_id: String) -> HttpResponse {
-        // Usamos un Mutex asíncrono para bloquear el acceso a la lista de nodos
-        let nodes = self.nodes.lock().await;
 
-        // Buscar el DataNode que contiene el bloque
-        let node_id = nodes
-            .iter()
-            .find(|(_, node_info)| node_info.block_ids.contains(&block_id))
-            .map(|(node_id, _)| *node_id);
+    pub async fn api_readblock(&self, block_id: u32) -> HttpResponse {
+        let block_partitions: Vec<PartitionInfo> = {
+            // Usamos un Mutex asíncrono para bloquear el acceso a las particiones
+            let partitions = self.partitions.lock().await;
 
-        match node_id {
-            Some(node_id) => {
+            // Buscar todas las particiones del bloque solicitado (filtramos por block_id)
+            partitions
+                .values()
+                .filter(|partition_info| partition_info.block == block_id)
+                .cloned()
+                .collect()
+        }; // Liberar el Mutex antes de continuar
+
+        if block_partitions.is_empty() {
+            // Si no se encontraron particiones para el bloque
+            return HttpResponse::NotFound().json(Response::Error {
+                message: format!("Bloque {} no encontrado en ningún DataNode.", block_id),
+            });
+        }
+
+        // Clonar la información de los nodos para liberar el Mutex antes de continuar
+        let nodes_info: HashMap<u32, DataNodeInfo> = {
+            let nodes = self.nodes.lock().await;
+            nodes.clone()
+        }; // Liberar el Mutex antes de continuar
+        let futures: Vec<_> = block_partitions
+            .into_iter()
+            .enumerate() // Añadir índice para elegir cíclicamente el nodo
+            .map(|(index, partition_info)| {
+                // Selección cíclica de los nodos
+                let node_info = nodes_info.values().nth(index % nodes_info.len()).cloned(); // Selecciona el nodo cíclicamente
                 println!(
-                    "Recuperando bloque con ID: {} del nodo {}",
-                    block_id, node_id
+                    "Recuperando partición {} del bloque {} del nodo {}",
+                    partition_info.partition, partition_info.block, partition_info.node
                 );
+                async move {
+                    if let Some(node_info) = node_info {
+                        let datanode_address = format!("127.0.0.1:{}", node_info.port);
 
-                // Obtener la dirección del DataNode
-                let datanode_port = nodes.get(&node_id).unwrap().port;
-                let datanode_address = format!("127.0.0.1:{}", datanode_port);
+                        match TcpStream::connect(datanode_address).await {
+                            Ok(mut stream) => {
+                                // Crear mensaje para leer la partición
+                                let data_message = DataMessage::ReadBlock {
+                                    block_id: partition_info.partition,
+                                };
 
-                // Intentar conectar al DataNode de manera asíncrona
-                match TcpStream::connect(datanode_address).await {
-                    Ok(mut stream) => {
-                        // Crear mensaje para leer el bloque
-                        let data_message = DataMessage::ReadBlock {
-                            block_id: block_id.clone(),
-                        };
+                                let message = match serde_json::to_string(&data_message) {
+                                    Ok(msg) => msg,
+                                    Err(e) => {
+                                        eprintln!("Error al serializar el mensaje: {}", e);
+                                        return Err("Error al serializar el mensaje".to_string());
+                                    }
+                                };
 
-                        // Serializar el mensaje a JSON
-                        let message = serde_json::to_string(&data_message).unwrap();
+                                // Enviar el mensaje al DataNode
+                                if let Err(e) = stream.write_all(message.as_bytes()).await {
+                                    eprintln!("Error al enviar el mensaje al DataNode: {}", e);
+                                    return Err("Error al comunicar con el DataNode".to_string());
+                                }
 
-                        // Enviar el mensaje al DataNode
-                        if let Err(e) = stream.write_all(message.as_bytes()).await {
-                            eprintln!("Error al enviar el mensaje al DataNode: {}", e);
-                            return HttpResponse::InternalServerError()
-                                .json("Error al comunicar con el DataNode");
-                        } else {
-                            println!("Mensaje enviado al DataNode");
-                        }
+                                let mut buffer = Vec::new();
+                                let mut temp_buffer = vec![0; 1024];
 
-                        // Leer la respuesta del DataNode
-                        let mut buffer = Vec::new();
-                        if let Err(e) = stream.read_to_end(&mut buffer).await {
-                            eprintln!("Error al leer los datos del DataNode: {}", e);
-                            return HttpResponse::InternalServerError()
-                                .json("Error al leer el bloque del DataNode");
-                        } else {
-                            println!("Datos leídos del DataNode");
-                        }
-
-                        // Intentamos deserializar el buffer como un valor JSON genérico
-                        match serde_json::from_slice::<serde_json::Value>(&buffer) {
-                            Ok(json) => {
-                                // Acceder al campo "BlockData" dentro del JSON
-                                if let Some(block_data) = json.get("BlockData") {
-                                    // Acceder al campo "data" que es un arreglo de bytes
-                                    if let Some(data) = block_data.get("data") {
-                                        // Intentamos convertir el arreglo de bytes (Vec<u8>) en un String
-                                        if let Some(bytes) = data.as_array() {
-                                            let byte_values: Vec<u8> = bytes
-                                                .iter()
-                                                .filter_map(|v| v.as_u64())
-                                                .map(|v| v as u8)
-                                                .collect();
-
-                                            match String::from_utf8(byte_values) {
-                                                Ok(string_data) => {
-                                                    // Responder con los datos convertidos a String
-                                                    return HttpResponse::Ok().body(string_data);
+                                loop {
+                                    match stream.read(&mut temp_buffer).await {
+                                        Ok(0) => break, // Fin de la conexión
+                                        Ok(n) => {
+                                            buffer.extend_from_slice(&temp_buffer[..n]);
+                                            // Intentar deserializar el JSON con el buffer acumulado
+                                            match serde_json::from_slice::<DataNodeMessage>(&buffer)
+                                            {
+                                                Ok(_) => {
+                                                    // Si la deserialización es exitosa, hemos recibido el mensaje completo
+                                                    break;
                                                 }
-                                                Err(e) => {
-                                                    eprintln!(
-                                                        "Error al convertir los datos a String: {}",
-                                                        e
-                                                    );
-                                                    return HttpResponse::InternalServerError()
-                                                        .body(
-                                                        "Error al convertir los datos   a String",
-                                                    );
+                                                Err(_) => {
+                                                    // Si la deserialización falla, significa que aún no tenemos un mensaje completo
+                                                    // Continuar leyendo más datos
                                                 }
                                             }
-                                        } else {
-                                            eprintln!(
-                                                "El campo 'data' no es un arreglo de bytes válido."
-                                            );
-                                            return HttpResponse::BadRequest().body("El campo 'data' no es un arreglo de bytes   válido.");
                                         }
-                                    } else {
-                                        eprintln!("No se encontró el campo 'data' en BlockData.");
-                                        return HttpResponse::BadRequest()
-                                            .body("No se encontró el campo 'data' en BlockData.");
+                                        Err(e) => {
+                                            eprintln!("Error al leer del stream: {}", e);
+                                            return Err("Error al leer del stream".to_string());
+                                        }
                                     }
-                                } else {
-                                    eprintln!("No se encontró 'BlockData' en el mensaje.");
-                                    return HttpResponse::BadRequest()
-                                        .body("No se encontró 'BlockData' en el mensaje.");
+                                }
+
+                                // Intentamos deserializar el buffer como un valor JSON
+                                match serde_json::from_slice::<DataNodeMessage>(&buffer) {
+                                    Ok(DataNodeMessage::BlockData { data }) => {
+                                        // Si la partición se encuentra correctamente, devolverla
+                                        println!(
+                                            "Partición {} del bloque {} recuperada del nodo {}",
+                                            partition_info.partition,
+                                            partition_info.block,
+                                            partition_info.node
+                                        );
+                                        Ok(data)
+                                    }
+                                    Ok(_) => {
+                                        println!("Mensaje de DataNode ignorado.");
+                                        Err("Mensaje de DataNode no esperado".to_string())
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Error al deserializar el mensaje: {}", e);
+                                        Err("Error al deserializar los datos del DataNode"
+                                            .to_string())
+                                    }
                                 }
                             }
                             Err(e) => {
-                                eprintln!("Error al deserializar el mensaje: {}", e);
-                                return HttpResponse::InternalServerError()
-                                    .body("Error al deserializar el mensaje.");
+                                // Error al conectar con el DataNode
+                                eprintln!("No se pudo conectar con el DataNode: {}", e);
+                                Err("No se pudo conectar con el DataNode".to_string())
                             }
                         }
-                    }
-                    Err(e) => {
-                        // Error al conectar con el DataNode
-                        eprintln!("No se pudo conectar con el DataNode: {}", e);
-                        HttpResponse::InternalServerError()
-                            .json("No se pudo conectar con el DataNode")
+                    } else {
+                        eprintln!(
+                            "No se encontró información del DataNode para la partición {}",
+                            partition_info.partition
+                        );
+                        Err("No se encontró información del DataNode".to_string())
                     }
                 }
-            }
-            None => {
-                // Si no se encontró un DataNode con el bloque
-                println!("Bloque {} no encontrado en ningún DataNode", block_id);
-                println!(
-                    "Lista actual de bloques almacenados: {:?}",
-                    nodes
-                        .iter()
-                        .map(|(_, node_info)| &node_info.block_ids)
-                        .collect::<Vec<_>>()
-                );
+            })
+            .collect();
 
-                // Responder con error 404
-                HttpResponse::NotFound().json(format!(
-                    "Bloque {} no encontrado en ningún DataNode",
-                    block_id
-                ))
+        // Ejecutar todas las lecturas de las particiones de manera concurrente
+        let results = join_all(futures).await;
+
+        // Recolectar los datos y manejar los errores
+        let mut reconstructed_data = Vec::new();
+        let mut errors = Vec::new();
+
+        for result in results {
+            match result {
+                Ok(data) => {
+                    reconstructed_data.extend(data);
+                }
+                Err(e) => {
+                    errors.push(e);
+                }
             }
         }
+
+        // Si hubo errores, devolver un mensaje de error con detalles
+        if !errors.is_empty() {
+            return HttpResponse::InternalServerError().json(Response::Error {
+                message: format!("Errores al recuperar las particiones: {:?}", errors),
+            });
+        }
+        //Convert reconstructed_data to a string
+        let reconstructed_data_str = String::from_utf8(reconstructed_data).unwrap();
+        // Si la reconstrucción fue exitosa, devolver los datos reconstruidos
+        HttpResponse::Ok().json(Response::BlockData {
+            data: reconstructed_data_str,
+        })
     }
 }
 
@@ -375,40 +535,88 @@ async fn start_namenode(namenode: web::Data<Arc<NameNode>>) {
     }
 }
 
-async fn api_get_status(namenode: web::Data<Arc<NameNode>>) -> HttpResponse {
-    namenode.api_get_status().await
+// La función api_post ajustada
+pub async fn api_post(namenode: web::Data<Arc<NameNode>>, req_body: String) -> HttpResponse {
+    println!("Raw JSON body received: {}", req_body);
+
+    match serde_json::from_str::<PostRequest>(&req_body) {
+        Ok(temp_payload) => match temp_payload {
+            PostRequest::StoreBlock { block_id, data } => {
+                println!("Block ID (String) received: {}", block_id);
+
+                // Intentar convertir el block_id de String a u32
+                let block_id_u32: u32 = match block_id.parse() {
+                    Ok(id) => id,
+                    Err(_) => {
+                        eprintln!("Error: El block_id proporcionado no es un número válido.");
+                        return HttpResponse::BadRequest().json(Response::Error {
+                            message: "El block_id proporcionado no es un número válido."
+                                .to_string(),
+                        });
+                    }
+                };
+
+                println!("Almacenando bloque con ID: {}", block_id_u32);
+
+                // Llamar a api_storeblock con el block_id convertido y los datos
+                namenode.api_storeblock(block_id_u32, data).await
+            }
+        },
+        Err(e) => {
+            eprintln!("Error al deserializar el JSON: {}", e);
+            HttpResponse::BadRequest().json(Response::Error {
+                message: "Error al deserializar el JSON".to_string(),
+            })
+        }
+    }
 }
 
-async fn api_post_storeblock(
+// La función API para manejar GET requests
+async fn api_get(
     namenode: web::Data<Arc<NameNode>>,
-    payload: web::Json<BlockStoreRequest>,
+    query: web::Query<GetRequest>, // Deserializamos en la estructura intermedia
 ) -> HttpResponse {
-    // Parsear el ID del bloque desde el cuerpo de la solicitud
-    let block_id = payload.block_id.clone();
-    let message = payload.message.clone();
-    print!("Almacenando bloque con ID: {}", block_id);
-    namenode.api_storeblock(block_id.clone(), message).await;
-    HttpResponse::Ok().json(format!("Bloque {} almacenado correctamente", block_id))
-}
+    match query.into_inner() {
+        GetRequest { r#type, block_id } if r#type == "ReadBlock" => {
+            if let Some(block_id) = block_id {
+                println!("Recuperando bloque con ID: {}", block_id);
 
-async fn api_get_readblock(
-    namenode: web::Data<Arc<NameNode>>,
-    query: web::Query<BlockReadRequest>,
-) -> HttpResponse {
-    let block_id = &query.block_id;
+                // Intentar convertir el block_id de String a u32
+                let block_id_u32: u32 = match block_id.parse() {
+                    Ok(id) => id,
+                    Err(_) => {
+                        eprintln!("Error: El block_id proporcionado no es un número válido.");
+                        return HttpResponse::BadRequest().json(Response::Error {
+                            message: "El block_id proporcionado no es un número válido."
+                                .to_string(),
+                        });
+                    }
+                };
 
-    // Imprimir el block_id recibido
-    print!("Recuperando bloque con ID: {}", block_id);
-    namenode.api_readblock(block_id.clone()).await
+                namenode.api_readblock(block_id_u32).await
+            } else {
+                HttpResponse::BadRequest().json(Response::Error {
+                    message: "Falta el parámetro 'block_id'".to_string(),
+                })
+            }
+        }
+        GetRequest { r#type, .. } if r#type == "GetStatus" => {
+            println!("Obteniendo el estado del NameNode");
+            namenode.api_get_status().await
+        }
+        _ => HttpResponse::BadRequest().json(Response::Error {
+            message: "Solicitud no válida".to_string(),
+        }),
+    }
 }
 
 async fn run_api_server(namenode: web::Data<Arc<NameNode>>) {
     HttpServer::new(move || {
         App::new()
             .app_data(namenode.clone()) // Agrega el Arc<NameNode> a las rutas
-            .route("/status", web::get().to(api_get_status))
-            .route("/storeblock", web::post().to(api_post_storeblock)) // Agregar la ruta para almacenar bloques
-            .route("/readblock", web::get().to(api_get_readblock)) // Agregar la ruta para recuperar el contenido de los bloques
+            .route("/status", web::get().to(api_get))
+            .route("/storeblock", web::post().to(api_post)) // Agregar la ruta para almacenar bloques
+            .route("/readblock", web::get().to(api_get)) // Agregar la ruta para recuperar el contenido de los bloques
     })
     .bind(format!("127.0.0.1:{}", API_PORT))
     .expect("Unable to start API server")

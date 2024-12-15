@@ -9,22 +9,26 @@ pub enum DataNodeMessage {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum DataMessage {
-    StoreBlock { block_id: String, data: Vec<u8> },
-    ReadBlock { block_id: String },
+    StoreBlock { block_id: u32, data: Vec<u8> },
+    ReadBlock { block_id: u32 },
 }
 
-#[derive(Serialize)]
-pub struct StatusResponse {
-    pub status: Vec<String>,
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(tag = "type", content = "data")]
+pub enum PostRequest {
+    StoreBlock { block_id: String, data: String },
 }
 
-#[derive(Deserialize)]
-pub struct BlockStoreRequest {
-    pub block_id: String,
-    pub message: String,
+#[derive(Deserialize, Debug)]
+pub struct GetRequest {
+    pub r#type: String, // `type` es una palabra reservada en Rust, por eso se usa `r#type`
+    pub block_id: Option<String>, // Opcional porque no todas las variantes necesitan `block_id`
 }
 
-#[derive(Deserialize)]
-pub struct BlockReadRequest {
-    pub block_id: String,
+#[derive(Serialize, Deserialize, Debug)]
+pub enum Response {
+    Ok { message: String },
+    Error { message: String },
+    BlockData { data: String },
+    Status { status: Vec<String> },
 }
