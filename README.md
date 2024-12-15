@@ -86,4 +86,10 @@ Thank you for your interest in contributing to hkfs! To ensure a smooth and effi
 
 8. **Pull Request**: Open a pull request to the main repository. Provide a clear description of your changes and any additional context that might be helpful.
 
-We appreciate your contributions and look forward to working with you!
+I appreciate your contributions and look forward to working with you!
+
+# Author
+
+* Raúl Moldes Castillo
+* raul.moldes.work@gmail.com
+* @RaulMoldes
